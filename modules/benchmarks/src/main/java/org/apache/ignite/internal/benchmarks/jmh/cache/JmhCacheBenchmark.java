@@ -83,9 +83,9 @@ public class JmhCacheBenchmark extends JmhCacheAbstractBenchmark {
      */
     public static void main(String[] args) throws Exception {
         run("put", CacheAtomicityMode.ATOMIC);
-        run("get", CacheAtomicityMode.ATOMIC);
-        run("put", CacheAtomicityMode.TRANSACTIONAL);
-        run("get", CacheAtomicityMode.TRANSACTIONAL);
+//        run("get", CacheAtomicityMode.ATOMIC);
+//        run("put", CacheAtomicityMode.TRANSACTIONAL);
+//        run("get", CacheAtomicityMode.TRANSACTIONAL);
     }
 
     /**
@@ -96,9 +96,9 @@ public class JmhCacheBenchmark extends JmhCacheAbstractBenchmark {
      * @throws Exception If failed.
      */
     private static void run(String benchmark, CacheAtomicityMode atomicityMode) throws Exception {
-        run(benchmark, 4, true, atomicityMode, CacheWriteSynchronizationMode.PRIMARY_SYNC);
-        run(benchmark, 4, true, atomicityMode, CacheWriteSynchronizationMode.FULL_SYNC);
-        run(benchmark, 4, false, atomicityMode, CacheWriteSynchronizationMode.PRIMARY_SYNC);
+//        run(benchmark, 4, true, atomicityMode, CacheWriteSynchronizationMode.PRIMARY_SYNC);
+//        run(benchmark, 4, true, atomicityMode, CacheWriteSynchronizationMode.FULL_SYNC);
+//        run(benchmark, 4, false, atomicityMode, CacheWriteSynchronizationMode.PRIMARY_SYNC);
         run(benchmark, 4, false, atomicityMode, CacheWriteSynchronizationMode.FULL_SYNC);
     }
 
@@ -128,7 +128,7 @@ public class JmhCacheBenchmark extends JmhCacheAbstractBenchmark {
             .warmupIterations(10)
             .measurementIterations(60)
             .benchmarks(simpleClsName + "." + benchmark)
-            .output(output + ".jmh.log")
+            //.output(output + ".jmh.log")
             .profilers(GCProfiler.class)
             .jvmArguments(
                 "-Xms4g",
@@ -138,7 +138,7 @@ public class JmhCacheBenchmark extends JmhCacheAbstractBenchmark {
                 "-XX:StartFlightRecording=delay=30s,dumponexit=true,settings=alloc,filename=" + output + ".jfr",
                 JmhIdeBenchmarkRunner.createProperty(PROP_ATOMICITY_MODE, atomicityMode),
                 JmhIdeBenchmarkRunner.createProperty(PROP_WRITE_SYNC_MODE, writeSyncMode),
-                JmhIdeBenchmarkRunner.createProperty(PROP_DATA_NODES, 2),
+                JmhIdeBenchmarkRunner.createProperty(PROP_DATA_NODES, 1),
                 JmhIdeBenchmarkRunner.createProperty(PROP_CLIENT_MODE, client))
             .run();
     }
