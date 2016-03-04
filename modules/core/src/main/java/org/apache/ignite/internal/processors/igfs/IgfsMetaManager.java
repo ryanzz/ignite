@@ -72,6 +72,7 @@ import org.apache.ignite.internal.processors.cache.GridCacheInternal;
 import org.apache.ignite.internal.processors.cache.IgniteInternalCache;
 import org.apache.ignite.internal.processors.cache.transactions.IgniteInternalTx;
 import org.apache.ignite.internal.processors.task.GridInternal;
+import org.apache.ignite.internal.transactions.IgniteTxOptimisticCheckedException;
 import org.apache.ignite.internal.util.GridLeanMap;
 import org.apache.ignite.internal.util.GridSpinBusyLock;
 import org.apache.ignite.internal.util.lang.GridClosureException;
@@ -84,6 +85,7 @@ import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.lang.IgniteBiTuple;
 import org.apache.ignite.lang.IgniteClosure;
 import org.apache.ignite.lang.IgniteUuid;
+import org.apache.ignite.transactions.TransactionOptimisticException;
 import org.jetbrains.annotations.Nullable;
 
 import static org.apache.ignite.events.EventType.EVT_IGFS_DIR_CREATED;
@@ -94,8 +96,10 @@ import static org.apache.ignite.events.EventType.EVT_IGFS_FILE_OPENED_WRITE;
 import static org.apache.ignite.internal.processors.igfs.IgfsFileInfo.ROOT_ID;
 import static org.apache.ignite.internal.processors.igfs.IgfsFileInfo.TRASH_ID;
 import static org.apache.ignite.internal.processors.igfs.IgfsFileInfo.builder;
+import static org.apache.ignite.transactions.TransactionConcurrency.OPTIMISTIC;
 import static org.apache.ignite.transactions.TransactionConcurrency.PESSIMISTIC;
 import static org.apache.ignite.transactions.TransactionIsolation.REPEATABLE_READ;
+import static org.apache.ignite.transactions.TransactionIsolation.SERIALIZABLE;
 
 /**
  * Cache based structure (meta data) manager.
@@ -328,7 +332,7 @@ public class IgfsMetaManager extends IgfsManager {
     public List<IgniteUuid> fileIds(IgfsPath path) throws IgniteCheckedException {
         if (busyLock.enterBusy()) {
             try {
-                assert validTxState(false);
+//                assert validTxState(false);
 
                 return fileIds(path, false);
             }
@@ -481,35 +485,40 @@ public class IgfsMetaManager extends IgfsManager {
                 assert validTxState(false);
                 assert fileId != null;
 
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    // Lock file ID for this transaction.
-                    IgfsFileInfo oldInfo = info(fileId);
+                    try {
+                        // Lock file ID for this transaction.
+                        IgfsFileInfo oldInfo = info(fileId);
 
-                    if (oldInfo == null)
-                        return null;
+                        if (oldInfo == null)
+                            return null;
 
-                    if (oldInfo.lockId() != null)
-                        return null; // The file is already locked, we cannot lock it.
+                        if (oldInfo.lockId() != null)
+                            return null; // The file is already locked, we cannot lock it.
 
-                    IgfsFileInfo newInfo = lockInfo(oldInfo, isDeleteLock);
+                        IgfsFileInfo newInfo = lockInfo(oldInfo, isDeleteLock);
 
-                    boolean put = id2InfoPrj.replace(fileId, oldInfo, newInfo);
+                        boolean put = id2InfoPrj.replace(fileId, oldInfo, newInfo);
 
-                    assert put : "Value was not stored in cache [fileId=" + fileId + ", newInfo=" + newInfo + ']';
+                        assert put : "Value was not stored in cache [fileId=" + fileId + ", newInfo=" + newInfo + ']';
 
-                    assert newInfo.id().equals(oldInfo.id()); // Same id.
+                        assert newInfo.id().equals(oldInfo.id()); // Same id.
 
-                    tx.commit();
+                        tx.commit();
 
-                    return newInfo;
-                }
-                catch (GridClosureException e) {
-                    throw U.cast(e);
-                }
-                finally {
-                    tx.close();
+                        return newInfo;
+                    }
+                    catch (GridClosureException e) {
+                        throw U.cast(e);
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -866,111 +875,116 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 assert validTxState(false);
 
-                // 1. First get source and destination path IDs.
-                List<IgniteUuid> srcPathIds = fileIds(srcPath);
-                List<IgniteUuid> dstPathIds = fileIds(dstPath);
-
-                final Set<IgniteUuid> allIds = new TreeSet<>(PATH_ID_SORTING_COMPARATOR);
-
-                allIds.addAll(srcPathIds);
-
-                final IgniteUuid dstLeafId = dstPathIds.get(dstPathIds.size() - 1);
-
-                if (dstLeafId == null) {
-                    // Delete null entry for the unexisting destination element:
-                    dstPathIds.remove(dstPathIds.size() - 1);
-                }
-
-                allIds.addAll(dstPathIds);
-
-                if (allIds.remove(null)) {
-                    throw new IgfsPathNotFoundException("Failed to perform move because some path component was " +
-                            "not found. [src=" + srcPath + ", dst=" + dstPath + ']');
-                }
-
                 // 2. Start transaction.
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    // 3. Obtain the locks.
-                    final Map<IgniteUuid, IgfsFileInfo> allInfos = lockIds(allIds);
+                    try {
+                        // 1. First get source and destination path IDs.
+                        List<IgniteUuid> srcPathIds = fileIds(srcPath);
+                        List<IgniteUuid> dstPathIds = fileIds(dstPath);
 
-                    // 4. Verify integrity of source directory.
-                    if (!verifyPathIntegrity(srcPath, srcPathIds, allInfos)) {
-                        throw new IgfsPathNotFoundException("Failed to perform move because source directory " +
-                            "structure changed concurrently [src=" + srcPath + ", dst=" + dstPath + ']');
-                    }
+                        final Set<IgniteUuid> allIds = new TreeSet<>(PATH_ID_SORTING_COMPARATOR);
 
-                    // 5. Verify integrity of destination directory.
-                    final IgfsPath dstDirPath = dstLeafId != null ? dstPath : dstPath.parent();
+                        allIds.addAll(srcPathIds);
 
-                    if (!verifyPathIntegrity(dstDirPath, dstPathIds, allInfos)) {
-                        throw new IgfsPathNotFoundException("Failed to perform move because destination directory " +
-                            "structure changed concurrently [src=" + srcPath + ", dst=" + dstPath + ']');
-                    }
+                        final IgniteUuid dstLeafId = dstPathIds.get(dstPathIds.size() - 1);
 
-                    // 6. Calculate source and destination targets which will be changed.
-                    IgniteUuid srcTargetId = srcPathIds.get(srcPathIds.size() - 2);
-                    IgfsFileInfo srcTargetInfo = allInfos.get(srcTargetId);
-                    String srcName = srcPath.name();
+                        if (dstLeafId == null) {
+                            // Delete null entry for the unexisting destination element:
+                            dstPathIds.remove(dstPathIds.size() - 1);
+                        }
 
-                    IgniteUuid dstTargetId;
-                    IgfsFileInfo dstTargetInfo;
-                    String dstName;
+                        allIds.addAll(dstPathIds);
 
-                    if (dstLeafId != null) {
-                        // Destination leaf exists. Check if it is an empty directory.
-                        IgfsFileInfo dstLeafInfo = allInfos.get(dstLeafId);
+                        if (allIds.remove(null)) {
+                            throw new IgfsPathNotFoundException("Failed to perform move because some path component was " +
+                                "not found. [src=" + srcPath + ", dst=" + dstPath + ']');
+                        }
 
-                        assert dstLeafInfo != null;
+                        // 3. Obtain the locks.
+                        final Map<IgniteUuid, IgfsFileInfo> allInfos = lockIds(allIds);
 
-                        if (dstLeafInfo.isDirectory()) {
-                            // Destination is a directory.
-                            dstTargetId = dstLeafId;
-                            dstTargetInfo = dstLeafInfo;
-                            dstName = srcPath.name();
+                        // 4. Verify integrity of source directory.
+                        if (!verifyPathIntegrity(srcPath, srcPathIds, allInfos)) {
+                            throw new IgfsPathNotFoundException("Failed to perform move because source directory " +
+                                "structure changed concurrently [src=" + srcPath + ", dst=" + dstPath + ']');
+                        }
+
+                        // 5. Verify integrity of destination directory.
+                        final IgfsPath dstDirPath = dstLeafId != null ? dstPath : dstPath.parent();
+
+                        if (!verifyPathIntegrity(dstDirPath, dstPathIds, allInfos)) {
+                            throw new IgfsPathNotFoundException("Failed to perform move because destination directory " +
+                                "structure changed concurrently [src=" + srcPath + ", dst=" + dstPath + ']');
+                        }
+
+                        // 6. Calculate source and destination targets which will be changed.
+                        IgniteUuid srcTargetId = srcPathIds.get(srcPathIds.size() - 2);
+                        IgfsFileInfo srcTargetInfo = allInfos.get(srcTargetId);
+                        String srcName = srcPath.name();
+
+                        IgniteUuid dstTargetId;
+                        IgfsFileInfo dstTargetInfo;
+                        String dstName;
+
+                        if (dstLeafId != null) {
+                            // Destination leaf exists. Check if it is an empty directory.
+                            IgfsFileInfo dstLeafInfo = allInfos.get(dstLeafId);
+
+                            assert dstLeafInfo != null;
+
+                            if (dstLeafInfo.isDirectory()) {
+                                // Destination is a directory.
+                                dstTargetId = dstLeafId;
+                                dstTargetInfo = dstLeafInfo;
+                                dstName = srcPath.name();
+                            }
+                            else {
+                                // Error, destination is existing file.
+                                throw new IgfsPathAlreadyExistsException("Failed to perform move " +
+                                    "because destination points to " +
+                                    "existing file [src=" + srcPath + ", dst=" + dstPath + ']');
+                            }
                         }
                         else {
-                            // Error, destination is existing file.
-                            throw new IgfsPathAlreadyExistsException("Failed to perform move " +
-                                "because destination points to " +
-                                "existing file [src=" + srcPath + ", dst=" + dstPath + ']');
+                            // Destination leaf doesn't exist, so we operate on parent.
+                            dstTargetId = dstPathIds.get(dstPathIds.size() - 1);
+                            dstTargetInfo = allInfos.get(dstTargetId);
+                            dstName = dstPath.name();
                         }
+
+                        assert dstTargetInfo != null;
+                        assert dstTargetInfo.isDirectory();
+
+                        // 7. Last check: does destination target already have listing entry with the same name?
+                        if (dstTargetInfo.listing().containsKey(dstName)) {
+                            throw new IgfsPathAlreadyExistsException("Failed to perform move because destination already " +
+                                "contains entry with the same name existing file [src=" + srcPath +
+                                ", dst=" + dstPath + ']');
+                        }
+
+                        // 8. Actual move: remove from source parent and add to destination target.
+                        IgfsListingEntry entry = srcTargetInfo.listing().get(srcName);
+
+                        id2InfoPrj.invoke(srcTargetId, new ListingRemove(srcName, entry.fileId()));
+                        id2InfoPrj.invoke(dstTargetId, new ListingAdd(dstName, entry));
+
+                        tx.commit();
+
+                        IgfsPath realNewPath = new IgfsPath(dstDirPath, dstName);
+
+                        IgfsFileInfo moved = allInfos.get(srcPathIds.get(srcPathIds.size() - 1));
+
+                        // Set the new path to the info to simplify event creation:
+                        return IgfsFileInfo.builder(moved).path(realNewPath).build();
                     }
-                    else {
-                        // Destination leaf doesn't exist, so we operate on parent.
-                        dstTargetId = dstPathIds.get(dstPathIds.size() - 1);
-                        dstTargetInfo = allInfos.get(dstTargetId);
-                        dstName = dstPath.name();
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
                     }
-
-                    assert dstTargetInfo != null;
-                    assert dstTargetInfo.isDirectory();
-
-                    // 7. Last check: does destination target already have listing entry with the same name?
-                    if (dstTargetInfo.listing().containsKey(dstName)) {
-                        throw new IgfsPathAlreadyExistsException("Failed to perform move because destination already " +
-                            "contains entry with the same name existing file [src=" + srcPath +
-                            ", dst=" + dstPath + ']');
+                    finally {
+                        tx.close();
                     }
-
-                    // 8. Actual move: remove from source parent and add to destination target.
-                    IgfsListingEntry entry = srcTargetInfo.listing().get(srcName);
-
-                    id2InfoPrj.invoke(srcTargetId, new ListingRemove(srcName, entry.fileId()));
-                    id2InfoPrj.invoke(dstTargetId, new ListingAdd(dstName, entry));
-
-                    tx.commit();
-
-                    IgfsPath realNewPath = new IgfsPath(dstDirPath, dstName);
-
-                    IgfsFileInfo moved = allInfos.get(srcPathIds.get(srcPathIds.size() - 1));
-
-                    // Set the new path to the info to simplify event creation:
-                    return IgfsFileInfo.builder(moved).path(realNewPath).build();
-                }
-                finally {
-                    tx.close();
                 }
             }
             finally {
@@ -1112,44 +1126,49 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 assert validTxState(false);
 
-                final IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    // NB: We may lock root because its id is less than any other id:
-                    final IgfsFileInfo rootInfo = lockIds(ROOT_ID, TRASH_ID).get(ROOT_ID);
+                    try {
+                        // NB: We may lock root because its id is less than any other id:
+                        final IgfsFileInfo rootInfo = lockIds(ROOT_ID, TRASH_ID).get(ROOT_ID);
 
-                    assert rootInfo != null;
+                        assert rootInfo != null;
 
-                    Map<String, IgfsListingEntry> rootListingMap = rootInfo.listing();
+                        Map<String, IgfsListingEntry> rootListingMap = rootInfo.listing();
 
-                    assert rootListingMap != null;
+                        assert rootListingMap != null;
 
-                    if (rootListingMap.isEmpty())
-                        return null; // Root is empty, nothing to do.
+                        if (rootListingMap.isEmpty())
+                            return null; // Root is empty, nothing to do.
 
-                    // Construct new info and move locked entries from root to it.
-                    Map<String, IgfsListingEntry> transferListing = new HashMap<>(rootListingMap);
+                        // Construct new info and move locked entries from root to it.
+                        Map<String, IgfsListingEntry> transferListing = new HashMap<>(rootListingMap);
 
-                    IgfsFileInfo newInfo = new IgfsFileInfo(transferListing);
+                        IgfsFileInfo newInfo = new IgfsFileInfo(transferListing);
 
-                    id2InfoPrj.put(newInfo.id(), newInfo);
+                        id2InfoPrj.put(newInfo.id(), newInfo);
 
-                    // Add new info to trash listing.
-                    id2InfoPrj.invoke(TRASH_ID, new ListingAdd(newInfo.id().toString(),
-                        new IgfsListingEntry(newInfo)));
+                        // Add new info to trash listing.
+                        id2InfoPrj.invoke(TRASH_ID, new ListingAdd(newInfo.id().toString(),
+                            new IgfsListingEntry(newInfo)));
 
-                    // Remove listing entries from root.
-                    // Note that root directory properties and other attributes are preserved:
-                    id2InfoPrj.put(ROOT_ID, new IgfsFileInfo(null/*listing*/, rootInfo));
+                        // Remove listing entries from root.
+                        // Note that root directory properties and other attributes are preserved:
+                        id2InfoPrj.put(ROOT_ID, new IgfsFileInfo(null/*listing*/, rootInfo));
 
-                    tx.commit();
+                        tx.commit();
 
-                    delWorker.signal();
+                        delWorker.signal();
 
-                    return newInfo.id();
-                }
-                finally {
-                    tx.close();
+                        return newInfo.id();
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -1174,84 +1193,89 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 assert validTxState(false);
 
-                final SortedSet<IgniteUuid> allIds = new TreeSet<>(PATH_ID_SORTING_COMPARATOR);
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                List<IgniteUuid> pathIdList = fileIds(path);
+                    try {
+                        final SortedSet<IgniteUuid> allIds = new TreeSet<>(PATH_ID_SORTING_COMPARATOR);
 
-                assert pathIdList.size() > 1;
+                        List<IgniteUuid> pathIdList = fileIds(path);
 
-                final IgniteUuid victimId = pathIdList.get(pathIdList.size() - 1);
+                        assert pathIdList.size() > 1;
 
-                assert !TRASH_ID.equals(victimId) : "TRASH does not have path, it cannot ever be deletion victim.";
-                assert !ROOT_ID.equals(victimId); // root deletion is prevented in earlier stages.
+                        final IgniteUuid victimId = pathIdList.get(pathIdList.size() - 1);
 
-                allIds.addAll(pathIdList);
+                        assert !TRASH_ID.equals(victimId) : "TRASH does not have path, it cannot ever be deletion victim.";
+                        assert !ROOT_ID.equals(victimId); // root deletion is prevented in earlier stages.
 
-                if (allIds.remove(null))
-                    return null; // A fragment of the path no longer exists.
+                        allIds.addAll(pathIdList);
 
-                boolean added = allIds.add(TRASH_ID);
-                assert added;
+                        if (allIds.remove(null))
+                            return null; // A fragment of the path no longer exists.
 
-                final IgniteInternalTx tx = startTx();
+                        boolean added = allIds.add(TRASH_ID);
+                        assert added;
 
-                try {
-                    final Map<IgniteUuid, IgfsFileInfo> infoMap = lockIds(allIds);
+                        final Map<IgniteUuid, IgfsFileInfo> infoMap = lockIds(allIds);
 
-                    // Directory starure was changed concurrently, so the original path no longer exists:
-                    if (!verifyPathIntegrity(path, pathIdList, infoMap))
-                        return null;
+                        // Directory starure was changed concurrently, so the original path no longer exists:
+                        if (!verifyPathIntegrity(path, pathIdList, infoMap))
+                            return null;
 
-                    final IgfsFileInfo victimInfo = infoMap.get(victimId);
+                        final IgfsFileInfo victimInfo = infoMap.get(victimId);
 
-                    if (!recursive && victimInfo.isDirectory() && !victimInfo.listing().isEmpty())
-                        // Throw exception if not empty and not recursive.
-                        throw new IgfsDirectoryNotEmptyException("Failed to remove directory (directory is not " +
-                            "empty and recursive flag is not set).");
+                        if (!recursive && victimInfo.isDirectory() && !victimInfo.listing().isEmpty())
+                            // Throw exception if not empty and not recursive.
+                            throw new IgfsDirectoryNotEmptyException("Failed to remove directory (directory is not " +
+                                "empty and recursive flag is not set).");
 
-                    IgfsFileInfo destInfo = infoMap.get(TRASH_ID);
+                        IgfsFileInfo destInfo = infoMap.get(TRASH_ID);
 
-                    assert destInfo != null;
+                        assert destInfo != null;
 
-                    final String srcFileName = path.name();
+                        final String srcFileName = path.name();
 
-                    final String destFileName = victimId.toString();
+                        final String destFileName = victimId.toString();
 
-                    assert destInfo.listing().get(destFileName) == null : "Failed to add file name into the " +
-                        "destination directory (file already exists) [destName=" + destFileName + ']';
+                        assert destInfo.listing().get(destFileName) == null : "Failed to add file name into the " +
+                            "destination directory (file already exists) [destName=" + destFileName + ']';
 
-                    IgfsFileInfo srcParentInfo = infoMap.get(pathIdList.get(pathIdList.size() - 2));
+                        IgfsFileInfo srcParentInfo = infoMap.get(pathIdList.get(pathIdList.size() - 2));
 
-                    assert srcParentInfo != null;
+                        assert srcParentInfo != null;
 
-                    IgniteUuid srcParentId = srcParentInfo.id();
-                    assert srcParentId.equals(pathIdList.get(pathIdList.size() - 2));
+                        IgniteUuid srcParentId = srcParentInfo.id();
+                        assert srcParentId.equals(pathIdList.get(pathIdList.size() - 2));
 
-                    IgfsListingEntry srcEntry = srcParentInfo.listing().get(srcFileName);
+                        IgfsListingEntry srcEntry = srcParentInfo.listing().get(srcFileName);
 
-                    assert srcEntry != null : "Deletion victim not found in parent listing [path=" + path +
-                        ", name=" + srcFileName + ", listing=" + srcParentInfo.listing() + ']';
+                        assert srcEntry != null : "Deletion victim not found in parent listing [path=" + path +
+                            ", name=" + srcFileName + ", listing=" + srcParentInfo.listing() + ']';
 
-                    assert victimId.equals(srcEntry.fileId());
+                        assert victimId.equals(srcEntry.fileId());
 
-                    id2InfoPrj.invoke(srcParentId, new ListingRemove(srcFileName, srcEntry.fileId()));
+                        id2InfoPrj.invoke(srcParentId, new ListingRemove(srcFileName, srcEntry.fileId()));
 
-                    // Add listing entry into the destination parent listing.
-                    id2InfoPrj.invoke(TRASH_ID, new ListingAdd(destFileName, srcEntry));
+                        // Add listing entry into the destination parent listing.
+                        id2InfoPrj.invoke(TRASH_ID, new ListingAdd(destFileName, srcEntry));
 
-                    if (victimInfo.isFile())
-                        // Update a file info of the removed file with a file path,
-                        // which will be used by delete worker for event notifications.
-                        id2InfoPrj.invoke(victimId, new UpdatePath(path));
+                        if (victimInfo.isFile())
+                            // Update a file info of the removed file with a file path,
+                            // which will be used by delete worker for event notifications.
+                            id2InfoPrj.invoke(victimId, new UpdatePath(path));
 
-                    tx.commit();
+                        tx.commit();
 
-                    delWorker.signal();
+                        delWorker.signal();
 
-                    return victimId;
-                }
-                finally {
-                    tx.close();
+                        return victimId;
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -1356,69 +1380,74 @@ public class IgfsMetaManager extends IgfsManager {
                 assert listing != null;
                 assert validTxState(false);
 
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    Collection<IgniteUuid> res = new HashSet<>();
+                    try {
+                        Collection<IgniteUuid> res = new HashSet<>();
 
-                    // Obtain all necessary locks in one hop.
-                    IgniteUuid[] allIds = new IgniteUuid[listing.size() + 1];
+                        // Obtain all necessary locks in one hop.
+                        IgniteUuid[] allIds = new IgniteUuid[listing.size() + 1];
 
-                    allIds[0] = parentId;
+                        allIds[0] = parentId;
 
-                    int i = 1;
+                        int i = 1;
 
-                    for (IgfsListingEntry entry : listing.values())
-                        allIds[i++] = entry.fileId();
+                        for (IgfsListingEntry entry : listing.values())
+                            allIds[i++] = entry.fileId();
 
-                    Map<IgniteUuid, IgfsFileInfo> locks = lockIds(allIds);
+                        Map<IgniteUuid, IgfsFileInfo> locks = lockIds(allIds);
 
-                    IgfsFileInfo parentInfo = locks.get(parentId);
+                        IgfsFileInfo parentInfo = locks.get(parentId);
 
-                    // Ensure parent is still in place.
-                    if (parentInfo != null) {
-                        Map<String, IgfsListingEntry> newListing =
-                            new HashMap<>(parentInfo.listing().size(), 1.0f);
+                        // Ensure parent is still in place.
+                        if (parentInfo != null) {
+                            Map<String, IgfsListingEntry> newListing =
+                                new HashMap<>(parentInfo.listing().size(), 1.0f);
 
-                        newListing.putAll(parentInfo.listing());
+                            newListing.putAll(parentInfo.listing());
 
-                        // Remove child entries if possible.
-                        for (Map.Entry<String, IgfsListingEntry> entry : listing.entrySet()) {
-                            IgniteUuid entryId = entry.getValue().fileId();
+                            // Remove child entries if possible.
+                            for (Map.Entry<String, IgfsListingEntry> entry : listing.entrySet()) {
+                                IgniteUuid entryId = entry.getValue().fileId();
 
-                            IgfsFileInfo entryInfo = locks.get(entryId);
+                                IgfsFileInfo entryInfo = locks.get(entryId);
 
-                            if (entryInfo != null) {
-                                // File must be locked for deletion:
-                                assert entryInfo.isDirectory() || DELETE_LOCK_ID.equals(entryInfo.lockId());
+                                if (entryInfo != null) {
+                                    // File must be locked for deletion:
+                                    assert entryInfo.isDirectory() || DELETE_LOCK_ID.equals(entryInfo.lockId());
 
-                                // Delete only files or empty folders.
-                                if (entryInfo.isFile() || entryInfo.isDirectory() && entryInfo.listing().isEmpty()) {
-                                    id2InfoPrj.getAndRemove(entryId);
+                                    // Delete only files or empty folders.
+                                    if (entryInfo.isFile() || entryInfo.isDirectory() && entryInfo.listing().isEmpty()) {
+                                        id2InfoPrj.getAndRemove(entryId);
 
+                                        newListing.remove(entry.getKey());
+
+                                        res.add(entryId);
+                                    }
+                                }
+                                else {
+                                    // Entry was deleted concurrently.
                                     newListing.remove(entry.getKey());
 
                                     res.add(entryId);
                                 }
                             }
-                            else {
-                                // Entry was deleted concurrently.
-                                newListing.remove(entry.getKey());
 
-                                res.add(entryId);
-                            }
+                            // Update parent listing.
+                            id2InfoPrj.put(parentId, new IgfsFileInfo(newListing, parentInfo));
                         }
 
-                        // Update parent listing.
-                        id2InfoPrj.put(parentId, new IgfsFileInfo(newListing, parentInfo));
+                        tx.commit();
+
+                        return res;
                     }
-
-                    tx.commit();
-
-                    return res;
-                }
-                finally {
-                    tx.close();
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -1445,45 +1474,50 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 assert validTxState(false);
 
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    boolean res = false;
+                    try {
+                        boolean res = false;
 
-                    Map<IgniteUuid, IgfsFileInfo> infos = lockIds(parentId, id);
+                        Map<IgniteUuid, IgfsFileInfo> infos = lockIds(parentId, id);
 
-                    IgfsFileInfo victim = infos.get(id);
+                        IgfsFileInfo victim = infos.get(id);
 
-                    if (victim == null)
-                        return res;
+                        if (victim == null)
+                            return res;
 
-                    assert victim.isDirectory() || DELETE_LOCK_ID.equals(victim.lockId()) :
+                        assert victim.isDirectory() || DELETE_LOCK_ID.equals(victim.lockId()) :
                             " isDir: " + victim.isDirectory() + ", lockId: " + victim.lockId();
 
-                    // Proceed only in case both parent and child exist.
-                    if (infos.containsKey(parentId) && infos.containsKey(id)) {
-                        IgfsFileInfo parentInfo = infos.get(parentId);
+                        // Proceed only in case both parent and child exist.
+                        if (infos.containsKey(parentId) && infos.containsKey(id)) {
+                            IgfsFileInfo parentInfo = infos.get(parentId);
 
-                        assert parentInfo != null;
+                            assert parentInfo != null;
 
-                        IgfsListingEntry listingEntry = parentInfo.listing().get(name);
+                            IgfsListingEntry listingEntry = parentInfo.listing().get(name);
 
-                        if (listingEntry != null)
-                            id2InfoPrj.invoke(parentId, new ListingRemove(name, listingEntry.fileId()));
+                            if (listingEntry != null)
+                                id2InfoPrj.invoke(parentId, new ListingRemove(name, listingEntry.fileId()));
 
-                        IgfsFileInfo deleted = id2InfoPrj.getAndRemove(id);
+                            IgfsFileInfo deleted = id2InfoPrj.getAndRemove(id);
 
-                        assert victim.id().equals(deleted.id());
+                            assert victim.id().equals(deleted.id());
 
-                        res = true;
+                            res = true;
+                        }
+
+                        tx.commit();
+
+                        return res;
                     }
-
-                    tx.commit();
-
-                    return res;
-                }
-                finally {
-                    tx.close();
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -1626,17 +1660,22 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 assert validTxState(false);
 
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    IgfsFileInfo info = updatePropertiesNonTx(parentId, fileId, fileName, props);
+                    try {
+                        IgfsFileInfo info = updatePropertiesNonTx(parentId, fileId, fileName, props);
 
-                    tx.commit();
+                        tx.commit();
 
-                    return info;
-                }
-                finally {
-                    tx.close();
+                        return info;
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -1696,45 +1735,90 @@ public class IgfsMetaManager extends IgfsManager {
                 if (log.isDebugEnabled())
                     log.debug("Update file info [fileId=" + fileId + ", c=" + c + ']');
 
-                IgniteInternalTx tx = id2InfoPrj.isLockedByThread(fileId) ? null : startTx();
+//                IgniteInternalTx tx = id2InfoPrj.isLockedByThread(fileId) ? null : startTx();
+//
+//                try {
+//                    // Lock file ID for this transaction.
+//                    IgfsFileInfo oldInfo = info(fileId);
+//
+//                    if (oldInfo == null)
+//                        return null; // File not found.
+//
+//                    IgfsFileInfo newInfo = c.apply(oldInfo);
+//
+//                    if (newInfo == null)
+//                        throw fsException("Failed to update file info with null value" +
+//                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+//
+//                    if (!oldInfo.id().equals(newInfo.id()))
+//                        throw fsException("Failed to update file info (file IDs differ)" +
+//                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+//
+//                    if (oldInfo.isDirectory() != newInfo.isDirectory())
+//                        throw fsException("Failed to update file info (file types differ)" +
+//                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+//
+//                    boolean b = id2InfoPrj.replace(fileId, oldInfo, newInfo);
+//
+//                    assert b : "Inconsistent transaction state [oldInfo=" + oldInfo + ", newInfo=" + newInfo +
+//                        ", c=" + c + ']';
+//
+//                    if (tx != null)
+//                        tx.commit();
+//
+//                    return newInfo;
+//                }
+//                catch (GridClosureException e) {
+//                    throw U.cast(e);
+//                }
+//                finally {
+//                    if (tx != null)
+//                        tx.close();
+//                }
 
-                try {
-                    // Lock file ID for this transaction.
-                    IgfsFileInfo oldInfo = info(fileId);
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                    if (oldInfo == null)
-                        return null; // File not found.
+                    try {
+                        // Lock file ID for this transaction.
+                        IgfsFileInfo oldInfo = info(fileId);
 
-                    IgfsFileInfo newInfo = c.apply(oldInfo);
+                        if (oldInfo == null)
+                            return null; // File not found.
 
-                    if (newInfo == null)
-                        throw fsException("Failed to update file info with null value" +
-                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+                        IgfsFileInfo newInfo = c.apply(oldInfo);
 
-                    if (!oldInfo.id().equals(newInfo.id()))
-                        throw fsException("Failed to update file info (file IDs differ)" +
-                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+                        if (newInfo == null)
+                            throw fsException("Failed to update file info with null value" +
+                                " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
 
-                    if (oldInfo.isDirectory() != newInfo.isDirectory())
-                        throw fsException("Failed to update file info (file types differ)" +
-                            " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
+                        if (!oldInfo.id().equals(newInfo.id()))
+                            throw fsException("Failed to update file info (file IDs differ)" +
+                                " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
 
-                    boolean b = id2InfoPrj.replace(fileId, oldInfo, newInfo);
+                        if (oldInfo.isDirectory() != newInfo.isDirectory())
+                            throw fsException("Failed to update file info (file types differ)" +
+                                " [oldInfo=" + oldInfo + ", newInfo=" + newInfo + ", c=" + c + ']');
 
-                    assert b : "Inconsistent transaction state [oldInfo=" + oldInfo + ", newInfo=" + newInfo +
-                        ", c=" + c + ']';
+                        boolean b = id2InfoPrj.replace(fileId, oldInfo, newInfo);
 
-                    if (tx != null)
-                        tx.commit();
+                        assert b : "Inconsistent transaction state [oldInfo=" + oldInfo + ", newInfo=" + newInfo +
+                            ", c=" + c + ']';
 
-                    return newInfo;
-                }
-                catch (GridClosureException e) {
-                    throw U.cast(e);
-                }
-                finally {
-                    if (tx != null)
+                        if (tx != null)
+                            tx.commit();
+
+                        return newInfo;
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    catch (GridClosureException e) {
+                        throw U.cast(e);
+                    }
+                    finally {
                         tx.close();
+                    }
                 }
             }
             finally {
@@ -1763,65 +1847,76 @@ public class IgfsMetaManager extends IgfsManager {
         while (true) {
             if (busyLock.enterBusy()) {
                 try {
-                    b = new DirectoryChainBuilder(path, props, props);
-
                     // Start TX.
-                    IgniteInternalTx tx = startTx();
+                    while (true) {
+                        IgniteInternalTx tx = startTx2();
 
-                    try {
-                        final Map<IgniteUuid, IgfsFileInfo> lockedInfos = lockIds(b.idSet);
+                        try {
+                            b = new DirectoryChainBuilder(path, props, props);
 
-                        // If the path was changed, we close the current Tx and repeat the procedure again
-                        // starting from taking the path ids.
-                        if (verifyPathIntegrity(b.existingPath, b.idList, lockedInfos)) {
-                            // Locked path okay, trying to proceed with the remainder creation.
-                            IgfsFileInfo lowermostExistingInfo = lockedInfos.get(b.lowermostExistingId);
+                            final Map<IgniteUuid, IgfsFileInfo> lockedInfos = lockIds(b.idSet);
 
-                            // Check only the lowermost directory in the existing directory chain
-                            // because others are already checked in #verifyPathIntegrity() above.
-                            if (!lowermostExistingInfo.isDirectory())
-                                throw new IgfsParentNotDirectoryException("Failed to create directory (parent " +
-                                    "element is not a directory)");
+                            // If the path was changed, we close the current Tx and repeat the procedure again
+                            // starting from taking the path ids.
+                            if (verifyPathIntegrity(b.existingPath, b.idList, lockedInfos)) {
+                                // Locked path okay, trying to proceed with the remainder creation.
+                                IgfsFileInfo lowermostExistingInfo = lockedInfos.get(b.lowermostExistingId);
 
-                            if (b.existingIdCnt == b.components.size() + 1) {
-                                assert b.existingPath.equals(path);
-                                assert lockedInfos.size() == b.existingIdCnt;
-
-                                // The target directory already exists, nothing to do.
-                                // (The fact that all the path consisns of directories is already checked above).
-                                // Note that properties are not updated in this case.
-                                return false;
-                            }
-
-                            Map<String, IgfsListingEntry> parentListing = lowermostExistingInfo.listing();
-
-                            String shortName = b.components.get(b.existingIdCnt - 1);
-
-                            IgfsListingEntry entry = parentListing.get(shortName);
-
-                            if (entry == null) {
-                                b.doBuild();
-
-                                tx.commit();
-
-                                break;
-                            }
-                            else {
-                                // Another thread created file or directory with the same name.
-                                if (!entry.isDirectory()) {
-                                    // Entry exists, and it is not a directory:
+                                // Check only the lowermost directory in the existing directory chain
+                                // because others are already checked in #verifyPathIntegrity() above.
+                                if (!lowermostExistingInfo.isDirectory())
                                     throw new IgfsParentNotDirectoryException("Failed to create directory (parent " +
                                         "element is not a directory)");
+
+                                if (b.existingIdCnt == b.components.size() + 1) {
+                                    assert b.existingPath.equals(path);
+                                    assert lockedInfos.size() == b.existingIdCnt;
+
+                                    // The target directory already exists, nothing to do.
+                                    // (The fact that all the path consisns of directories is already checked above).
+                                    // Note that properties are not updated in this case.
+                                    return false;
                                 }
 
-                                // If this is a directory, we continue the repeat loop,
-                                // because we cannot lock this directory without
-                                // lock ordering rule violation.
+                                Map<String, IgfsListingEntry> parentListing = lowermostExistingInfo.listing();
+
+                                String shortName = b.components.get(b.existingIdCnt - 1);
+
+                                IgfsListingEntry entry = parentListing.get(shortName);
+
+                                if (entry == null) {
+                                    b.doBuild();
+
+                                    tx.commit();
+
+                                    assert b != null;
+
+                                    b.sendEvents();
+
+                                    return true;
+                                }
+                                else {
+                                    // Another thread created file or directory with the same name.
+                                    if (!entry.isDirectory()) {
+                                        // Entry exists, and it is not a directory:
+                                        throw new IgfsParentNotDirectoryException("Failed to create directory (parent " +
+                                            "element is not a directory)");
+                                    }
+
+                                    // If this is a directory, we continue the repeat loop,
+                                    // because we cannot lock this directory without
+                                    // lock ordering rule violation.
+                                }
                             }
+
+                            break;
                         }
-                    }
-                    finally {
-                        tx.close();
+                        catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                            // No-op.
+                        }
+                        finally {
+                            tx.close();
+                        }
                     }
                 }
                 finally {
@@ -1831,12 +1926,6 @@ public class IgfsMetaManager extends IgfsManager {
             else
                 throw new IllegalStateException("Failed to mkdir because Grid is stopping. [path=" + path + ']');
         }
-
-        assert b != null;
-
-        b.sendEvents();
-
-        return true;
     }
 
     /**
@@ -1851,17 +1940,22 @@ public class IgfsMetaManager extends IgfsManager {
             try {
                 validTxState(false);
 
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    Object prev = val != null ? metaCache.getAndPut(sampling, val) : metaCache.getAndRemove(sampling);
+                    try {
+                        Object prev = val != null ? metaCache.getAndPut(sampling, val) : metaCache.getAndRemove(sampling);
 
-                    tx.commit();
+                        tx.commit();
 
-                    return !F.eq(prev, val);
-                }
-                finally {
-                    tx.close();
+                        return !F.eq(prev, val);
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -2695,183 +2789,189 @@ public class IgfsMetaManager extends IgfsManager {
         T res = null;
 
         while (!finished) {
-            // Obtain existing IDs outside the transaction.
-            List<List<IgniteUuid>> pathIds = new ArrayList<>(paths.length);
+            while (true) {
+                IgniteInternalTx tx = startTx2();
 
-            for (IgfsPath path : paths)
-                pathIds.add(fileIds(path));
+                try {
+                    // Obtain existing IDs outside the transaction.
+                    List<List<IgniteUuid>> pathIds = new ArrayList<>(paths.length);
 
-            // Start pessimistic.
-            IgniteInternalTx tx = startTx();
+                    for (IgfsPath path : paths)
+                        pathIds.add(fileIds(path));
 
-            try {
-                // Lock the very first existing parents and possibly the leaf as well.
-                Map<IgfsPath, IgfsPath> pathToParent = new HashMap<>();
+                    // Lock the very first existing parents and possibly the leaf as well.
+                    Map<IgfsPath, IgfsPath> pathToParent = new HashMap<>();
 
-                Map<IgfsPath, IgniteUuid> pathToId = new HashMap<>();
+                    Map<IgfsPath, IgniteUuid> pathToId = new HashMap<>();
 
-                for (int i = 0; i < paths.length; i++) {
-                    IgfsPath path = paths[i];
+                    for (int i = 0; i < paths.length; i++) {
+                        IgfsPath path = paths[i];
 
-                    // Determine the very first existing parent
-                    List<IgniteUuid> ids = pathIds.get(i);
+                        // Determine the very first existing parent
+                        List<IgniteUuid> ids = pathIds.get(i);
 
-                    if (ids.size() > 1) {
-                        // The path is not root.
-                        IgfsPath parentPath = path.parent();
-                        IgniteUuid parentId = ids.get(ids.size() - 2);
+                        if (ids.size() > 1) {
+                            // The path is not root.
+                            IgfsPath parentPath = path.parent();
+                            IgniteUuid parentId = ids.get(ids.size() - 2);
 
-                        for (int j = ids.size() - 3; j >= 0; j--) {
-                            if (parentId != null)
-                                break;
-                            else {
-                                parentPath = parentPath.parent();
-                                parentId = ids.get(j);
+                            for (int j = ids.size() - 3; j >= 0; j--) {
+                                if (parentId != null)
+                                    break;
+                                else {
+                                    parentPath = parentPath.parent();
+                                    parentId = ids.get(j);
+                                }
                             }
+
+                            assert parentPath != null && parentId != null;
+
+                            pathToParent.put(path, parentPath);
+
+                            pathToId.put(parentPath, parentId);
                         }
 
-                        assert parentPath != null && parentId != null;
+                        IgniteUuid pathId = ids.get(ids.size() - 1);
 
-                        pathToParent.put(path, parentPath);
-
-                        pathToId.put(parentPath, parentId);
+                        if (pathId != null)
+                            pathToId.put(path, pathId);
                     }
 
-                    IgniteUuid pathId = ids.get(ids.size() - 1);
+                    IgniteUuid[] lockArr = new IgniteUuid[extraLockIds == null ? pathToId.size() : pathToId.size() +
+                        extraLockIds.size()];
 
-                    if (pathId != null)
-                        pathToId.put(path, pathId);
-                }
+                    int idx = 0;
 
-                IgniteUuid[] lockArr = new IgniteUuid[extraLockIds == null ? pathToId.size() : pathToId.size() +
-                    extraLockIds.size()];
-
-                int idx = 0;
-
-                for (IgniteUuid id : pathToId.values())
-                    lockArr[idx++] = id;
-
-                if (extraLockIds != null) {
-                    for (IgniteUuid id : extraLockIds)
+                    for (IgniteUuid id : pathToId.values())
                         lockArr[idx++] = id;
-                }
 
-                Map<IgniteUuid, IgfsFileInfo> idToInfo = lockIds(lockArr);
-
-                if (extraLockIds != null) {
-                    for (IgniteUuid id : extraLockIds)
-                        idToInfo.remove(id);
-                }
-
-                // Ensure that locked IDs still point to expected paths.
-                IgfsPath changed = null;
-
-                for (Map.Entry<IgfsPath, IgniteUuid> entry : pathToId.entrySet()) {
-                    if (!idToInfo.containsKey(entry.getValue()) ||
-                        !F.eq(entry.getValue(), fileId(entry.getKey(), true))) {
-                        changed = entry.getKey();
-
-                        break;
+                    if (extraLockIds != null) {
+                        for (IgniteUuid id : extraLockIds)
+                            lockArr[idx++] = id;
                     }
-                }
 
-                if (changed != null) {
-                    finished = true;
+                    Map<IgniteUuid, IgfsFileInfo> idToInfo = lockIds(lockArr);
 
-                    throw fsException(new IgfsConcurrentModificationException("File system entry has been " +
-                        "modified concurrently: " + changed));
-                }
-                else {
-                    boolean newParents = false;
+                    if (extraLockIds != null) {
+                        for (IgniteUuid id : extraLockIds)
+                            idToInfo.remove(id);
+                    }
 
-                    // Check whether any new parents appeared before we have obtained the locks.
-                    for (int i = 0; i < paths.length; i++) {
-                        List<IgniteUuid> newIds = fileIds(paths[i], true);
+                    // Ensure that locked IDs still point to expected paths.
+                    IgfsPath changed = null;
 
-                        if (!pathIds.get(i).equals(newIds)) {
-                            newParents = true;
+                    for (Map.Entry<IgfsPath, IgniteUuid> entry : pathToId.entrySet()) {
+                        if (!idToInfo.containsKey(entry.getValue()) ||
+                            !F.eq(entry.getValue(), fileId(entry.getKey(), true))) {
+                            changed = entry.getKey();
 
                             break;
                         }
                     }
 
-                    if (newParents)
-                        continue; // Release all locks and try again.
+                    if (changed != null) {
+                        finished = true;
+
+                        throw fsException(new IgfsConcurrentModificationException("File system entry has been " +
+                            "modified concurrently: " + changed));
+                    }
                     else {
-                        // Perform synchronization.
-                        Map<IgfsPath, IgfsFileInfo> infos = new HashMap<>();
+                        boolean newParents = false;
 
-                        TreeMap<IgfsPath, IgfsFileInfo> created = new TreeMap<>();
+                        // Check whether any new parents appeared before we have obtained the locks.
+                        for (int i = 0; i < paths.length; i++) {
+                            List<IgniteUuid> newIds = fileIds(paths[i], true);
 
-                        for (IgfsPath path : paths) {
-                            IgfsPath parentPath = path.parent();
+                            if (!pathIds.get(i).equals(newIds)) {
+                                newParents = true;
 
-                            if (pathToId.containsKey(path)) {
-                                infos.put(path, info(pathToId.get(path)));
-
-                                if (parentPath != null)
-                                    infos.put(parentPath, info(pathToId.get(parentPath)));
+                                break;
                             }
-                            else {
-                                IgfsPath firstParentPath = pathToParent.get(path);
+                        }
 
-                                assert firstParentPath != null;
-                                assert pathToId.get(firstParentPath) != null;
+                        if (newParents)
+                            continue; // Release all locks and try again.
+                        else {
+                            // Perform synchronization.
+                            Map<IgfsPath, IgfsFileInfo> infos = new HashMap<>();
 
-                                IgfsFileInfo info = synchronize(fs,
-                                    firstParentPath,
-                                    idToInfo.get(pathToId.get(firstParentPath)),
-                                    path,
-                                    strict,
-                                    created);
+                            TreeMap<IgfsPath, IgfsFileInfo> created = new TreeMap<>();
 
-                                assert strict && info != null || !strict;
+                            for (IgfsPath path : paths) {
+                                IgfsPath parentPath = path.parent();
 
-                                if (info != null)
-                                    infos.put(path, info);
+                                if (pathToId.containsKey(path)) {
+                                    infos.put(path, info(pathToId.get(path)));
 
-                                if (parentPath != null) {
-                                    if (parentPath.equals(firstParentPath))
-                                        infos.put(firstParentPath, idToInfo.get(pathToId.get(firstParentPath)));
-                                    else {
-                                        assert strict && created.get(parentPath) != null || !strict;
+                                    if (parentPath != null)
+                                        infos.put(parentPath, info(pathToId.get(parentPath)));
+                                }
+                                else {
+                                    IgfsPath firstParentPath = pathToParent.get(path);
 
-                                        if (created.get(parentPath) != null)
-                                            infos.put(parentPath, created.get(parentPath));
+                                    assert firstParentPath != null;
+                                    assert pathToId.get(firstParentPath) != null;
+
+                                    IgfsFileInfo info = synchronize(fs,
+                                        firstParentPath,
+                                        idToInfo.get(pathToId.get(firstParentPath)),
+                                        path,
+                                        strict,
+                                        created);
+
+                                    assert strict && info != null || !strict;
+
+                                    if (info != null)
+                                        infos.put(path, info);
+
+                                    if (parentPath != null) {
+                                        if (parentPath.equals(firstParentPath))
+                                            infos.put(firstParentPath, idToInfo.get(pathToId.get(firstParentPath)));
                                         else {
-                                            // Put the last created path.
-                                            infos.put(created.lastKey(), created.get(created.lastKey()));
+                                            assert strict && created.get(parentPath) != null || !strict;
+
+                                            if (created.get(parentPath) != null)
+                                                infos.put(parentPath, created.get(parentPath));
+                                            else {
+                                                // Put the last created path.
+                                                infos.put(created.lastKey(), created.get(created.lastKey()));
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Finally, execute the task.
-                        finished = true;
+                            // Finally, execute the task.
+                            finished = true;
 
-                        try {
-                            res = task.onSuccess(infos);
-                        }
-                        catch (Exception e) {
-                            res = task.onFailure(e);
+                            try {
+                                res = task.onSuccess(infos);
+                            }
+                            catch (Exception e) {
+                                res = task.onFailure(e);
+                            }
                         }
                     }
-                }
 
-                tx.commit();
-            }
-            catch (IgniteCheckedException e) {
-                if (!finished) {
-                    finished = true;
+                    tx.commit();
 
-                    res = task.onFailure(e);
+                    break;
                 }
-                else
-                    throw e;
-            }
-            finally {
-                tx.close();
+                catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                    // No-op.
+                }
+                catch (IgniteCheckedException e) {
+                    if (!finished) {
+                        finished = true;
+
+                        res = task.onFailure(e);
+                    }
+                    else
+                        throw e;
+                }
+                finally {
+                    tx.close();
+                }
             }
         }
 
@@ -2923,6 +3023,15 @@ public class IgfsMetaManager extends IgfsManager {
     }
 
     /**
+     * Start transaction on meta cache.
+     *
+     * @return Transaction.
+     */
+    private IgniteInternalTx startTx2() {
+        return metaCache.txStartEx(OPTIMISTIC, SERIALIZABLE);
+    }
+
+    /**
      * Updates last access and last modification times.
      *
      * @param parentId File parent ID.
@@ -2939,45 +3048,52 @@ public class IgfsMetaManager extends IgfsManager {
                 assert validTxState(false);
 
                 // Start pessimistic transaction.
-                IgniteInternalTx tx = startTx();
+                while (true) {
+                    IgniteInternalTx tx = startTx2();
 
-                try {
-                    Map<IgniteUuid, IgfsFileInfo> infoMap = lockIds(fileId, parentId);
+                    try {
+                        Map<IgniteUuid, IgfsFileInfo> infoMap = lockIds(fileId, parentId);
 
-                    IgfsFileInfo fileInfo = infoMap.get(fileId);
+                        IgfsFileInfo fileInfo = infoMap.get(fileId);
 
-                    if (fileInfo == null)
-                        throw fsException(new IgfsPathNotFoundException("Failed to update times " +
+                        if (fileInfo == null)
+                            throw fsException(new IgfsPathNotFoundException("Failed to update times " +
                                 "(path was not found): " + fileName));
 
-                    IgfsFileInfo parentInfo = infoMap.get(parentId);
+                        IgfsFileInfo parentInfo = infoMap.get(parentId);
 
-                    if (parentInfo == null)
-                        throw fsException(new IgfsPathNotFoundException("Failed to update times " +
-                            "(parent was not found): " + fileName));
+                        if (parentInfo == null)
+                            throw fsException(new IgfsPathNotFoundException("Failed to update times " +
+                                "(parent was not found): " + fileName));
 
-                    IgfsListingEntry entry = parentInfo.listing().get(fileName);
+                        IgfsListingEntry entry = parentInfo.listing().get(fileName);
 
-                    // Validate listing.
-                    if (entry == null || !entry.fileId().equals(fileId))
-                        throw fsException(new IgfsConcurrentModificationException("Failed to update times " +
+                        // Validate listing.
+                        if (entry == null || !entry.fileId().equals(fileId))
+                            throw fsException(new IgfsConcurrentModificationException("Failed to update times " +
                                 "(file concurrently modified): " + fileName));
 
-                    assert parentInfo.isDirectory();
+                        assert parentInfo.isDirectory();
 
-                    IgfsFileInfo updated = new IgfsFileInfo(fileInfo,
-                        accessTime == -1 ? fileInfo.accessTime() : accessTime,
-                        modificationTime == -1 ? fileInfo.modificationTime() : modificationTime);
+                        IgfsFileInfo updated = new IgfsFileInfo(fileInfo,
+                            accessTime == -1 ? fileInfo.accessTime() : accessTime,
+                            modificationTime == -1 ? fileInfo.modificationTime() : modificationTime);
 
-                    id2InfoPrj.put(fileId, updated);
+                        id2InfoPrj.put(fileId, updated);
 
-                    id2InfoPrj.invoke(parentId, new UpdateListingEntry(fileId, fileName, 0, accessTime,
-                        modificationTime));
+                        id2InfoPrj.invoke(parentId, new UpdateListingEntry(fileId, fileName, 0, accessTime,
+                            modificationTime));
 
-                    tx.commit();
-                }
-                finally {
-                    tx.close();
+                        tx.commit();
+
+                        break;
+                    }
+                    catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                        // No-op.
+                    }
+                    finally {
+                        tx.close();
+                    }
                 }
             }
             finally {
@@ -3444,172 +3560,182 @@ public class IgfsMetaManager extends IgfsManager {
         while (true) {
             if (busyLock.enterBusy()) {
                 try {
-                    b = new DirectoryChainBuilder(path, dirProps, fileProps) {
-                        /** {@inheritDoc} */
-                        @Override protected IgfsFileInfo buildLeaf() {
-                            long t = System.currentTimeMillis();
-
-                            return new IgfsFileInfo(blockSize, 0L, affKey, composeLockId(false),
-                                 evictExclude, leafProps, t, t);
-                        }
-                    };
-
                     // Start Tx:
-                    IgniteInternalTx tx = startTx();
+                    while (true) {
+                        IgniteInternalTx tx = startTx2();
 
-                    try {
-                        if (overwrite)
-                            // Lock also the TRASH directory because in case of overwrite we
-                            // may need to delete the old file:
-                            b.idSet.add(TRASH_ID);
+                        try {
+                            b = new DirectoryChainBuilder(path, dirProps, fileProps) {
+                                /** {@inheritDoc} */
+                                @Override protected IgfsFileInfo buildLeaf() {
+                                    long t = System.currentTimeMillis();
 
-                        final Map<IgniteUuid, IgfsFileInfo> lockedInfos = lockIds(b.idSet);
+                                    return new IgfsFileInfo(blockSize, 0L, affKey, composeLockId(false),
+                                        evictExclude, leafProps, t, t);
+                                }
+                            };
 
-                        assert !overwrite || lockedInfos.get(TRASH_ID) != null; // TRASH must exist at this point.
+                            if (overwrite)
+                                // Lock also the TRASH directory because in case of overwrite we
+                                // may need to delete the old file:
+                                b.idSet.add(TRASH_ID);
 
-                        // If the path was changed, we close the current Tx and repeat the procedure again
-                        // starting from taking the path ids.
-                        if (verifyPathIntegrity(b.existingPath, b.idList, lockedInfos)) {
-                            // Locked path okay, trying to proceed with the remainder creation.
-                            final IgfsFileInfo lowermostExistingInfo = lockedInfos.get(b.lowermostExistingId);
+                            final Map<IgniteUuid, IgfsFileInfo> lockedInfos = lockIds(b.idSet);
 
-                            if (b.existingIdCnt == b.components.size() + 1) {
-                                // Full requestd path exists.
+                            assert !overwrite || lockedInfos.get(TRASH_ID) != null; // TRASH must exist at this point.
 
-                                assert b.existingPath.equals(path);
-                                assert lockedInfos.size() ==
+                            // If the path was changed, we close the current Tx and repeat the procedure again
+                            // starting from taking the path ids.
+                            if (verifyPathIntegrity(b.existingPath, b.idList, lockedInfos)) {
+                                // Locked path okay, trying to proceed with the remainder creation.
+                                final IgfsFileInfo lowermostExistingInfo = lockedInfos.get(b.lowermostExistingId);
+
+                                if (b.existingIdCnt == b.components.size() + 1) {
+                                    // Full requestd path exists.
+
+                                    assert b.existingPath.equals(path);
+                                    assert lockedInfos.size() ==
                                         (overwrite ? b.existingIdCnt + 1/*TRASH*/ : b.existingIdCnt);
 
-                                if (lowermostExistingInfo.isDirectory()) {
-                                    throw new IgfsPathAlreadyExistsException("Failed to "
+                                    if (lowermostExistingInfo == null)
+                                        continue;
+
+                                    if (lowermostExistingInfo.isDirectory()) {
+                                        throw new IgfsPathAlreadyExistsException("Failed to "
                                             + (append ? "open" : "create") + " file (path points to an " +
-                                        "existing directory): " + path);
-                                }
-                                else {
-                                    // This is a file.
-                                    assert lowermostExistingInfo.isFile();
+                                            "existing directory): " + path);
+                                    }
+                                    else {
+                                        // This is a file.
+                                        assert lowermostExistingInfo.isFile();
 
-                                    final IgniteUuid parentId = b.idList.get(b.idList.size() - 2);
+                                        final IgniteUuid parentId = b.idList.get(b.idList.size() - 2);
 
-                                    final IgniteUuid lockId = lowermostExistingInfo.lockId();
+                                        final IgniteUuid lockId = lowermostExistingInfo.lockId();
 
-                                    if (append) {
-                                        if (lockId != null)
-                                            throw fsException("Failed to open file (file is opened for writing) "
-                                                + "[fileName=" + name + ", fileId=" + lowermostExistingInfo.id()
-                                                + ", lockId=" + lockId + ']');
+                                        if (append) {
+                                            if (lockId != null)
+                                                throw fsException("Failed to open file (file is opened for writing) "
+                                                    + "[fileName=" + name + ", fileId=" + lowermostExistingInfo.id()
+                                                    + ", lockId=" + lockId + ']');
 
-                                        IgniteUuid newLockId = composeLockId(false);
+                                            IgniteUuid newLockId = composeLockId(false);
 
-                                        EntryProcessorResult<IgfsFileInfo> result
-                                            = id2InfoPrj.invoke(lowermostExistingInfo.id(),
+                                            EntryProcessorResult<IgfsFileInfo> result
+                                                = id2InfoPrj.invoke(lowermostExistingInfo.id(),
                                                 new LockFileProcessor(newLockId));
 
-                                        IgfsFileInfo lockedInfo = result.get();
+                                            IgfsFileInfo lockedInfo = result.get();
 
-                                        assert lockedInfo != null; // we already checked lock above.
-                                        assert lockedInfo.lockId() != null;
-                                        assert lockedInfo.lockId().equals(newLockId);
-                                        assert lockedInfo.id().equals(lowermostExistingInfo.id());
+                                            assert lockedInfo != null; // we already checked lock above.
+                                            assert lockedInfo.lockId() != null;
+                                            assert lockedInfo.lockId().equals(newLockId);
+                                            assert lockedInfo.id().equals(lowermostExistingInfo.id());
 
-                                        IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(lockedInfo, parentId);
+                                            IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(lockedInfo, parentId);
 
-                                        tx.commit();
+                                            tx.commit();
 
-                                        IgfsUtils.sendEvents(igfsCtx.kernalContext(), path,
+                                            IgfsUtils.sendEvents(igfsCtx.kernalContext(), path,
                                                 EventType.EVT_IGFS_FILE_OPENED_WRITE);
 
-                                        return t2;
-                                    }
-                                    else if (overwrite) {
-                                        // Delete existing file, but fail if it is locked:
-                                        if (lockId != null)
-                                            throw fsException("Failed to overwrite file (file is opened for writing) " +
+                                            return t2;
+                                        }
+                                        else if (overwrite) {
+                                            // Delete existing file, but fail if it is locked:
+                                            if (lockId != null)
+                                                throw fsException("Failed to overwrite file (file is opened for writing) " +
                                                     "[fileName=" + name + ", fileId=" + lowermostExistingInfo.id()
                                                     + ", lockId=" + lockId + ']');
 
-                                        final IgfsListingEntry deletedEntry = lockedInfos.get(parentId).listing()
+                                            final IgfsListingEntry deletedEntry = lockedInfos.get(parentId).listing()
                                                 .get(name);
 
-                                        assert deletedEntry != null;
+                                            assert deletedEntry != null;
 
-                                        id2InfoPrj.invoke(parentId, new ListingRemove(name, deletedEntry.fileId()));
+                                            id2InfoPrj.invoke(parentId, new ListingRemove(name, deletedEntry.fileId()));
 
-                                        // Add listing entry into the destination parent listing.
-                                        id2InfoPrj.invoke(TRASH_ID, new ListingAdd(
+                                            // Add listing entry into the destination parent listing.
+                                            id2InfoPrj.invoke(TRASH_ID, new ListingAdd(
                                                 lowermostExistingInfo.id().toString(), deletedEntry));
 
-                                        // Update a file info of the removed file with a file path,
-                                        // which will be used by delete worker for event notifications.
-                                        id2InfoPrj.invoke(lowermostExistingInfo.id(), new UpdatePath(path));
+                                            // Update a file info of the removed file with a file path,
+                                            // which will be used by delete worker for event notifications.
+                                            id2InfoPrj.invoke(lowermostExistingInfo.id(), new UpdatePath(path));
 
-                                        // Make a new locked info:
-                                        long t = System.currentTimeMillis();
+                                            // Make a new locked info:
+                                            long t = System.currentTimeMillis();
 
-                                        final IgfsFileInfo newFileInfo = new IgfsFileInfo(cfg.getBlockSize(), 0L,
-                                            affKey, composeLockId(false), evictExclude, fileProps, t, t);
+                                            final IgfsFileInfo newFileInfo = new IgfsFileInfo(cfg.getBlockSize(), 0L,
+                                                affKey, composeLockId(false), evictExclude, fileProps, t, t);
 
-                                        assert newFileInfo.lockId() != null; // locked info should be created.
+                                            assert newFileInfo.lockId() != null; // locked info should be created.
 
-                                        boolean put = id2InfoPrj.putIfAbsent(newFileInfo.id(), newFileInfo);
+                                            boolean put = id2InfoPrj.putIfAbsent(newFileInfo.id(), newFileInfo);
 
-                                        assert put;
+                                            assert put;
 
-                                        id2InfoPrj.invoke(parentId,
+                                            id2InfoPrj.invoke(parentId,
                                                 new ListingAdd(name, new IgfsListingEntry(newFileInfo)));
 
-                                        IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(newFileInfo, parentId);
+                                            IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(newFileInfo, parentId);
 
-                                        tx.commit();
+                                            tx.commit();
 
-                                        delWorker.signal();
+                                            delWorker.signal();
 
-                                        IgfsUtils.sendEvents(igfsCtx.kernalContext(), path, EVT_IGFS_FILE_OPENED_WRITE);
+                                            IgfsUtils.sendEvents(igfsCtx.kernalContext(), path, EVT_IGFS_FILE_OPENED_WRITE);
 
-                                        return t2;
-                                    }
-                                    else {
-                                        throw new IgfsPathAlreadyExistsException("Failed to create file (file " +
-                                            "already exists and overwrite flag is false): " + path);
+                                            return t2;
+                                        }
+                                        else {
+                                            throw new IgfsPathAlreadyExistsException("Failed to create file (file " +
+                                                "already exists and overwrite flag is false): " + path);
+                                        }
                                     }
                                 }
+
+                                // The full requested path does not exist.
+
+                                // Check only the lowermost directory in the existing directory chain
+                                // because others are already checked in #verifyPathIntegrity() above.
+                                if (!lowermostExistingInfo.isDirectory())
+                                    throw new IgfsParentNotDirectoryException("Failed to " + (append ? "open" : "create" )
+                                        + " file (parent element is not a directory)");
+
+                                Map<String, IgfsListingEntry> parentListing = lowermostExistingInfo.listing();
+
+                                final String uppermostFileToBeCreatedName = b.components.get(b.existingIdCnt - 1);
+
+                                final IgfsListingEntry entry = parentListing.get(uppermostFileToBeCreatedName);
+
+                                if (entry == null) {
+                                    b.doBuild();
+
+                                    assert b.leafInfo != null;
+                                    assert b.leafParentId != null;
+
+                                    IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(b.leafInfo, b.leafParentId);
+
+                                    tx.commit();
+
+                                    b.sendEvents();
+
+                                    return t2;
+                                }
+
+                                // Another thread concurrently created file or directory in the path with
+                                // the name we need.
                             }
 
-                            // The full requested path does not exist.
-
-                            // Check only the lowermost directory in the existing directory chain
-                            // because others are already checked in #verifyPathIntegrity() above.
-                            if (!lowermostExistingInfo.isDirectory())
-                                throw new IgfsParentNotDirectoryException("Failed to " + (append ? "open" : "create" )
-                                    + " file (parent element is not a directory)");
-
-                            Map<String, IgfsListingEntry> parentListing = lowermostExistingInfo.listing();
-
-                            final String uppermostFileToBeCreatedName = b.components.get(b.existingIdCnt - 1);
-
-                            final IgfsListingEntry entry = parentListing.get(uppermostFileToBeCreatedName);
-
-                            if (entry == null) {
-                                b.doBuild();
-
-                                assert b.leafInfo != null;
-                                assert b.leafParentId != null;
-
-                                IgniteBiTuple<IgfsFileInfo, IgniteUuid> t2 = new T2<>(b.leafInfo, b.leafParentId);
-
-                                tx.commit();
-
-                                b.sendEvents();
-
-                                return t2;
-                            }
-
-                            // Another thread concurrently created file or directory in the path with
-                            // the name we need.
+                            break;
                         }
-                    }
-                    finally {
-                        tx.close();
+                        catch (TransactionOptimisticException | IgniteTxOptimisticCheckedException e) {
+                            // No-op.
+                        }
+                        finally {
+                            tx.close();
+                        }
                     }
                 }
                 finally {

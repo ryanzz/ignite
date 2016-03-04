@@ -1454,7 +1454,7 @@ public abstract class IgfsAbstractSelfTest extends IgfsCommonAbstractTest {
                         Throwable cause = chain[chain.length - 1];
 
                         if (!e.getMessage().startsWith("Failed to overwrite file (file is opened for writing)")
-                                && (cause == null
+                                && (cause == null || cause.getMessage() == null
                                     || !cause.getMessage().startsWith("Failed to overwrite file (file is opened for writing)"))) {
 
                             System.out.println("Failed due to IgniteException exception. Cause:");
