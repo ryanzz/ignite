@@ -17,7 +17,9 @@
 
 package org.apache.ignite.internal.processors.cache;
 
-import org.apache.ignite.*;
+import org.apache.ignite.Ignite;
+import org.apache.ignite.IgniteCache;
+import org.apache.ignite.IgniteDataStreamer;
 import org.apache.ignite.binary.BinaryObject;
 import org.apache.ignite.binary.BinaryObjectBuilder;
 import org.apache.ignite.cache.CacheAtomicWriteOrderMode;
@@ -43,10 +45,6 @@ import javax.cache.integration.CacheLoaderException;
 import javax.cache.integration.CacheWriterException;
 import java.io.Serializable;
 import java.util.Map;
-import java.util.concurrent.CyclicBarrier;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.ignite.cache.CacheRebalanceMode.SYNC;
 
@@ -58,7 +56,7 @@ import static org.apache.ignite.cache.CacheRebalanceMode.SYNC;
  *     https://issues.apache.org/jira/browse/IGNITE-2753
  *     </a>
  */
-public class GridCacheStreamLocalStoreTest extends GridCommonAbstractTest {
+public class CacheStoreManagerSerializationTest extends GridCommonAbstractTest {
     /** IP finder. */
     protected static final TcpDiscoveryIpFinder IP_FINDER = new TcpDiscoveryVmIpFinder(true);
 
@@ -313,19 +311,29 @@ public class GridCacheStreamLocalStoreTest extends GridCommonAbstractTest {
         /** */
         Integer val;
 
-        /** */
+        /**
+         * Ctor.
+         */
         public TestObj() {
+            // No-op.
         }
 
-        /** */
+        /**
+         * Ctor.
+         *
+         * @param val Value.
+         */
         public TestObj(final Integer val) {
             this.val = val;
         }
 
         /** {@inheritDoc} */
         @Override public boolean equals(final Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
+            if (this == o)
+                return true;
+
+            if (o == null || getClass() != o.getClass())
+                return false;
 
             final TestObj testObj = (TestObj) o;
 

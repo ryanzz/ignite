@@ -36,7 +36,7 @@ import java.util.UUID;
  *     https://issues.apache.org/jira/browse/IGNITE-2753
  *     </a>
  */
-public class GridLocalCacheStreamLocalStoreTest extends GridCacheStreamLocalStoreTest {
+public class LocalCacheStoreManagerSerializationTest extends CacheStoreManagerSerializationTest {
     /** {@inheritDoc} */
     @Override protected CacheMode cacheMode() {
         return CacheMode.LOCAL;
@@ -52,7 +52,6 @@ public class GridLocalCacheStreamLocalStoreTest extends GridCacheStreamLocalStor
      */
     public void testUpdate() throws Exception {
         // Goal is to check correct saving to store (no exception must be thrown)
-
         final Ignite grid = startGrid();
 
         final IgniteCache<TestObj, TestObj> cache = grid.createCache(CACHE_NAME);
@@ -80,7 +79,6 @@ public class GridLocalCacheStreamLocalStoreTest extends GridCacheStreamLocalStor
      */
     public void testBinaryUpdate() throws Exception {
         // Goal is to check correct saving to store (no exception must be thrown)
-
         final Ignite grid = startGrid("binaryGrid");
 
         final IgniteCache<BinaryObject, BinaryObject> cache = grid.createCache(CACHE_NAME).withKeepBinary();

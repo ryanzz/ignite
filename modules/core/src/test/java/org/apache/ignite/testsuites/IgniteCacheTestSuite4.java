@@ -202,8 +202,8 @@ public class IgniteCacheTestSuite4 extends TestSuite {
         suite.addTestSuite(CacheStoreUsageMultinodeDynamicStartAtomicTest.class);
         suite.addTestSuite(CacheStoreUsageMultinodeDynamicStartTxTest.class);
 
-        suite.addTestSuite(GridCacheStreamLocalStoreTest.class);
-        suite.addTestSuite(GridLocalCacheStreamLocalStoreTest.class);
+        suite.addTestSuite(CacheStoreManagerSerializationTest.class);
+        suite.addTestSuite(LocalCacheStoreManagerSerializationTest.class);
 
         suite.addTestSuite(IgniteStartCacheInTransactionSelfTest.class);
         suite.addTestSuite(IgniteStartCacheInTransactionAtomicSelfTest.class);
